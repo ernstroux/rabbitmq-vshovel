@@ -143,22 +143,7 @@ parse_endpoint({Endpoint, Pos}) when is_list(Endpoint) ->
                   Other -> fail({expected_list, arguments, Other})
                 end,
 
-    ResourceDecls =
-    case rabbit_misc:pget(declarations, Arguments, []) of
-      Decls when is_list(Decls) ->
-        Decls;
-      Decls ->
-        fail({expected_list, declarations, Decls})
-    end,
-    {[], ResourceDecls1} =
-    run_state_monad(
-      lists:duplicate(length(ResourceDecls), fun parse_declaration/1),
-      {ResourceDecls, []}),
-
-    DeclareFun =
-    fun(_Conn, Ch) ->
-      [amqp_channel:call(Ch, M) || M <- lists:reverse(ResourceDecls1)]
-    end,
+    DeclareFun = constr_decl_fun(rabbit_misc:pget(declarations, Arguments, [])),
 
     return({#endpoint{protocol             = Protocol,
                       address              = Brokers1,
@@ -176,21 +161,38 @@ parse_endpoint({Endpoint, _Pos}) ->
 parse_endpoint(Protocol, {Endpoint, Pos}) when is_atom(Protocol),
                                                is_list(Endpoint) ->
   Mod = get_endpoint_module(Protocol),
-
-  Addresses0 = get_addresses(Endpoint),
-  Addresses = validate_addresses(Mod, Addresses0),
-
-  Arguments = case pget(arguments, Endpoint) of
-                Arguments0 when is_list(Arguments0) ->
-                  validate_arguments(Mod, Arguments0);
-                undefined -> [];
-                Other -> fail({expected_list, arguments, Other})
-              end,
-
-  return({#endpoint{protocol  = Protocol,
-                    address   = Addresses,
-                    arguments = Arguments},
+  Addresses = get_and_validate_addresses(Protocol, Endpoint, Mod),
+  Arguments = get_and_validate_args(pget(arguments, Endpoint), Mod),
+  return({#endpoint{protocol             = Protocol,
+                    address              = Addresses,
+                    arguments            = Arguments},
           Pos}).
+
+constr_decl_fun(ResourceDecls) when is_list(ResourceDecls) ->
+  {[], ResourceDecls1} =
+  run_state_monad(
+    lists:duplicate(length(ResourceDecls), fun parse_declaration/1),
+    {ResourceDecls, []}),
+  fun(_Conn, Ch) ->
+    [amqp_channel:call(Ch, M) || M <- lists:reverse(ResourceDecls1)]
+  end;
+constr_decl_fun(ResourceDecls) ->
+  fail({expected_list, declarations, ResourceDecls}).
+
+
+
+get_and_validate_addresses(smpp, _Endpoint, _Mod) ->
+  undefined;
+get_and_validate_addresses(_Protocol, Endpoint, Mod) ->
+  Addresses = get_addresses(Endpoint),
+  validate_addresses(Mod, Addresses).
+
+get_and_validate_args(Arguments, Mod) when is_list(Arguments) ->
+  validate_arguments(Mod, Arguments);
+get_and_validate_args(undefined, _) ->
+  [];
+get_and_validate_args(Other, _Mod) ->
+  fail({expected_list, arguments, Other}).
 
 check_uri({[Uri | Uris], Acc}) ->
   case amqp_uri:parse(Uri) of
