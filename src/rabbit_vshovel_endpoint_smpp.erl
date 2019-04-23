@@ -171,15 +171,10 @@ decoder_error(Pid, Error) ->
 send_smpp(Msg, Headers, Pid, Config, DeliveryTag) ->
   SourceAddr = get_header(source_addr, Config, Headers),
   DestAddr = get_header(dest_addr, Config, Headers),
-  case catch esmpp_lib_worker:submit(Pid, [{source_addr, SourceAddr},
-                                           {dest_addr, DestAddr},
-                                           {text, Msg},
-                                           {delivery_tag, DeliveryTag}]) of
-    ok -> {ok, 0};
-    Error ->
-      rabbit_vshovel_endpoint:notify_and_maybe_log(?MODULE, Error),
-      Error
-  end.
+  ok = esmpp_lib_worker:submit(Pid, [{source_addr, SourceAddr},
+                                     {dest_addr, DestAddr},
+                                     {text, Msg},
+                                     {delivery_tag, DeliveryTag}]).
 
 send_amqp(Args, Channel, Config) ->
   Exch = pget(deliver_sm_exchange, Config),
@@ -190,15 +185,18 @@ send_amqp(Args, Channel, Config) ->
   Status = pget(command_status, Args),
   SrcAddr = pget(source_addr, Args),
   DestAddr = pget(destination_addr, Args),
-  amqp_channel:cast(Channel,
-                    #'basic.publish'{exchange    = Exch,
-                                     routing_key = Queue},
-                    #amqp_msg{payload = Msg,
-                              props   = #'P_basic'{headers = [{<<"original_delivery_tag">>, long, DTag},
-                                                              {<<"esm_class">>, long, ESMClass},
-                                                              {<<"command_status">>, long, Status},
-                                                              {<<"source_addr">>, longstr, SrcAddr},
-                                                              {<<"dest_addr">>, longstr, DestAddr}]}}).
+  DataCoding = pget(data_coding, Args),
+  ok = amqp_channel:cast(Channel,
+                         #'basic.publish'{exchange    = Exch,
+                                          routing_key = Queue},
+                         #amqp_msg{payload = Msg,
+                                   props   = #'P_basic'{headers =
+                                                        [{<<"original_delivery_tag">>, long, DTag},
+                                                         {<<"esm_class">>, long, ESMClass},
+                                                         {<<"command_status">>, long, Status},
+                                                         {<<"source_addr">>, longstr, SrcAddr},
+                                                         {<<"dest_addr">>, longstr, DestAddr},
+                                                         {<<"data_coding">>, long, DataCoding}]}}).
 
 handle_response(Status, SeqNr) ->
   case ets:lookup(seq_nr_to_dtag, SeqNr) of
