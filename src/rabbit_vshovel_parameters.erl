@@ -92,7 +92,7 @@ notify_clear(VHost, <<"vshovel">>, Name, _Username) ->
   notify_clear(VHost, <<"vshovel">>, Name).
 %%----------------------------------------------------------------------------
 
-validation(User, CB, Def) ->
+validation(User, CB, _Def) ->
   [{<<"src-uri">>, validate_uri_fun(User), mandatory},
    {<<"dest-uri">>, validate_address_fun(User, CB), mandatory},
    {<<"dest-type">>, fun validate_dest_type_fun/2, optional},
@@ -110,8 +110,7 @@ validation(User, CB, Def) ->
    {<<"add-forward-headers">>, fun rabbit_parameter_validation:boolean/2, optional},
    {<<"add-timestamp-header">>, fun rabbit_parameter_validation:boolean/2, optional},
    {<<"publish-properties">>, fun validate_properties/2, optional},
-   {                                          <<"ack-mode">>, rabbit_parameter_validation:enum(
-     ['no-ack', 'on-publish', 'on-confirm']), optional},
+   {<<"ack-mode">>, rabbit_parameter_validation:enum(['no-ack', 'on-publish', 'on-confirm']), optional},
    {<<"delete-after">>, fun validate_delete_after/2, optional}
   ].
 

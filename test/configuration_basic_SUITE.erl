@@ -38,7 +38,8 @@ groups() ->
     {non_parallel_tests, [], [
       zero_vshovels,
       invalid_configuration,
-      valid_configuration
+      amqp_endpoint,
+      smpp_endpoint
     ]}
   ].
 
@@ -48,15 +49,12 @@ groups() ->
 
 init_per_suite(Config) ->
   rabbit_ct_helpers:log_environment(),
-  Config1 = rabbit_ct_helpers:set_config(Config, [
-    {rmq_nodename_suffix, ?MODULE}
-  ]),
+  Config1 = rabbit_ct_helpers:set_config(Config, [{rmq_nodename_suffix, ?MODULE}]),
   Config2 = rabbit_ct_helpers:run_setup_steps(Config1,
                                               rabbit_ct_broker_helpers:setup_steps() ++
                                               rabbit_ct_client_helpers:setup_steps()),
 
-  ok = rabbit_ct_broker_helpers:rpc(Config2, 0,
-                                    application, stop, [rabbitmq_vshovel]),
+  ok = rabbit_ct_broker_helpers:rpc(Config2, 0, application, stop, [rabbitmq_vshovel]),
   Config2.
 
 end_per_suite(Config) ->
@@ -74,6 +72,7 @@ init_per_testcase(Testcase, Config) ->
   rabbit_ct_helpers:testcase_started(Config, Testcase).
 
 end_per_testcase(Testcase, Config) ->
+  rabbit_ct_broker_helpers:rpc(Config, 0, application, stop, [rabbitmq_vshovel]),
   rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
 %% -------------------------------------------------------------------
@@ -81,8 +80,7 @@ end_per_testcase(Testcase, Config) ->
 %% -------------------------------------------------------------------
 
 zero_vshovels(Config) ->
-  passed = rabbit_ct_broker_helpers:rpc(Config, 0,
-                                        ?MODULE, zero_vshovels1, [Config]).
+  passed = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, zero_vshovels1, [Config]).
 
 zero_vshovels1(_Config) ->
   %% vshovel can be started with zero vshovels configured
@@ -91,8 +89,7 @@ zero_vshovels1(_Config) ->
   passed.
 
 invalid_configuration(Config) ->
-  passed = rabbit_ct_broker_helpers:rpc(Config, 0,
-                                        ?MODULE, invalid_configuration1, [Config]).
+  passed = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, invalid_configuration1, [Config]).
 
 invalid_configuration1(_Config) ->
   %% various ways of breaking the config
@@ -216,8 +213,8 @@ test_broken_vshovel_sources(Sources) ->
                               {queue, <<"">>}]),
   Error.
 
-valid_configuration(Config) ->
-  ok = setup_vshovels(Config),
+amqp_endpoint(Config) ->
+  ok = setup_vshovels(Config, setup_amqp_vshovel),
 
   Chan = rabbit_ct_client_helpers:open_channel(Config, 0),
 
@@ -278,14 +275,108 @@ valid_configuration(Config) ->
 
   rabbit_ct_client_helpers:close_channel(Chan).
 
-setup_vshovels(Config) ->
-  ok = rabbit_ct_broker_helpers:rpc(Config, 0,
-                                    ?MODULE, setup_vshovels1, [Config]).
+smpp_endpoint(Config) ->
 
-setup_vshovels1(Config) ->
+  setup_esmpp_meck(Config),
+
+  ok = setup_vshovels(Config, setup_smpp_vshovel),
+  Chan = rabbit_ct_client_helpers:open_channel(Config, 0),
+  #'queue.declare_ok'{queue = Q} =
+  amqp_channel:call(Chan, #'queue.declare'{exclusive = true}),
+  #'queue.bind_ok'{} =
+  amqp_channel:call(Chan, #'queue.bind'{queue       = Q, exchange = ?EXCHANGE,
+                                        routing_key = ?FROM_VSHOVEL}),
+  #'basic.consume_ok'{consumer_tag = CTag} =
+  amqp_channel:subscribe(Chan,
+                         #'basic.consume'{queue = Q, exclusive = true},
+                         self()),
+
+
+  receive
+    #'basic.consume_ok'{consumer_tag = CTag} -> ok
+  after ?TIMEOUT -> throw(timeout_waiting_for_consume_ok)
+  end,
+
+  ok = amqp_channel:call(Chan,
+                         #'basic.publish'{exchange    = ?EXCHANGE,
+                                          routing_key = ?TO_VSHOVEL},
+                         #amqp_msg{payload = <<42>>,
+                                   props   = #'P_basic'{
+                                     delivery_mode = 2,
+                                     content_type  = ?UNSHOVELLED}
+                         }),
+
+  receive
+    {#'basic.deliver'{consumer_tag = CTag, delivery_tag = AckTag,
+                      routing_key  = ?FROM_VSHOVEL},
+     #amqp_msg{}} ->
+      ok
+  after ?TIMEOUT -> throw(timeout_waiting_for_deliver1)
+  end,
+
+  [{test_vshovel, static, {running, _Info}, _Time}] =
+  rabbit_ct_broker_helpers:rpc(Config, 0,
+                               rabbit_vshovel_status, status, []),
+
+  rabbit_ct_client_helpers:close_channel(Chan).
+
+setup_esmpp_meck(Config) ->
+  MFAList = [{meck, new,
+              [esmpp_lib_worker, [no_link]]},
+             {meck, expect,
+              [esmpp_lib_worker, start_link, fun(_) -> {ok, c:pid(0, 0, 0)} end]},
+             {meck, expect,
+              [esmpp_lib_worker, unbind, fun(_) -> ok end]},
+             {meck, expect,
+              [esmpp_lib_worker, submit,
+               fun(Pid, Args) ->
+                 SrcAddr = rabbit_misc:pget(source_addr, Args),
+                 DstAddr = rabbit_misc:pget(dest_addr, Args),
+                 rabbit_vshovel_endpoint_smpp:sequence_number_handler([{sequence_number, 1} | Args]),
+                 rabbit_vshovel_endpoint_smpp:submit_sm_resp_handler(Pid,
+                                                                     [{sequence_number, 1},
+                                                                      {command_status, 0},
+                                                                      {message_id, <<"0">>}]),
+                 rabbit_vshovel_endpoint_smpp:deliver_sm_handler(Pid,
+                                                                 [{command_status, 0},
+                                                                  {source_addr, DstAddr},
+                                                                  {destination_addr, SrcAddr},
+                                                                  {short_message, <<"Test deliver SM Receipt">>},
+                                                                  {data_coding, 0},
+                                                                  {esm_class, 4},
+                                                                  {receipted_message_id, <<"0">>}])
+               end]}],
+  [rabbit_ct_broker_helpers:rpc(Config, 0, M, F, A) || {M, F, A} <- MFAList].
+%meck:new(esmpp_lib_worker, []),
+%meck:expect(esmpp_lib_worker, start_link, fun(_) -> {ok, c:pid(0, 0, 0)} end),
+%meck:expect(esmpp_lib_worker, unbind, fun(_) -> ok end),
+%meck:expect(esmpp_lib_worker, submit,
+%            fun(Pid, Args) ->
+%              SrcAddr = rabbit_misc:pget(source_addr, Args),
+%              DstAddr = rabbit_misc:pget(dest_addr, Args),
+%              rabbit_vshovel_endpoint_smpp:sequence_number_handler([{sequence_number, 1} | Args]),
+%              rabbit_vshovel_endpoint_smpp:submit_sm_resp_handler(Pid,
+%                                                                  [{sequence_number, 1},
+%                                                                   {command_status, 0},
+%                                                                   {message_id, <<"0">>}]),
+%              rabbit_vshovel_endpoint_smpp:deliver_sm_handler(Pid,
+%                                                              [{command_status, 0},
+%                                                               {source_addr, DstAddr},
+%                                                               {destination_addr, SrcAddr},
+%                                                               {short_message, <<"Test deliver SM Receipt">>},
+%                                                               {data_coding, 0},
+%                                                               {esm_class, 4},
+%                                                               {receipted_message_id, <<"0">>}])
+%            end).
+
+
+setup_vshovels(Config, VShovelCfgFun) ->
+  ok = rabbit_ct_broker_helpers:rpc(Config, 0,
+                                    ?MODULE, VShovelCfgFun, [Config]).
+
+setup_amqp_vshovel(Config) ->
   Hostname = ?config(rmq_hostname, Config),
-  TcpPort = rabbit_ct_broker_helpers:get_node_config(Config, 0,
-                                                     tcp_port_amqp),
+  TcpPort = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
   %% a working config
   application:set_env(
     rabbitmq_vshovel,
@@ -311,6 +402,58 @@ setup_vshovels1(Config) ->
                              {content_type, ?SHOVELLED}]},
        {add_forward_headers, true}
       ]}],
+    infinity),
+
+  ok = application:start(rabbitmq_vshovel),
+  await_running_vshovel(test_vshovel).
+
+setup_smpp_vshovel(Config) ->
+  Hostname = ?config(rmq_hostname, Config),
+  TcpPort = rabbit_ct_broker_helpers:get_node_config(Config, 0,
+                                                     tcp_port_amqp),
+  %% a working config
+  application:set_env(
+    rabbitmq_vshovel,
+    vshovels,
+    [{test_vshovel,
+      [{sources,
+        [{broker, rabbit_misc:format("amqp://~s:~b/%2f?heartbeat=5",
+                                     [Hostname, TcpPort])},
+         {arguments, [{declarations,
+                       [{'queue.declare', [exclusive, auto_delete]},
+                        {'exchange.declare', [{exchange, ?EXCHANGE}, auto_delete]},
+                        {'queue.bind', [{queue, <<>>}, {exchange, ?EXCHANGE},
+                                        {routing_key, ?TO_VSHOVEL}]}]}]}]},
+       {destinations,
+        [
+          {protocol, smpp},
+          {arguments,
+           [
+             {host, {127, 0, 0, 1}},
+             {port, 2775},
+             {password, <<"password">>},
+             {data_coding, 0},
+             {system_id, <<"smppclient1">>},
+             {interface_version, "3.4"},
+             {enquire_timeout, 30},
+             {submit_timeout, 60},
+             {system_type, ""},
+             {service_type, ""},
+             {addr_ton, 5},
+             {addr_npi, 0},
+             {source_addr, <<"123">>},
+             {source_addr_ton, 5},
+             {source_addr_npi, 0},
+             {dest_addr, <<"456">>},
+             {dest_addr_ton, 1},
+             {dest_addr_npi, 1},
+             {handler, rabbit_vshovel_endpoint_smpp},
+             {mode, transceiver},
+             {deliver_sm_exchange, ?EXCHANGE},
+             {deliver_sm_queue, ?FROM_VSHOVEL}]}]},
+       {queue, <<>>},
+       {prefetch_count, 10},
+       {reconnect_delay, 5}]}],
     infinity),
 
   ok = application:start(rabbitmq_vshovel),
