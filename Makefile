@@ -21,7 +21,8 @@ endef
 DEPS = rabbit_common amqp_client rabbit esmpp_lib
 dep_esmpp_lib = git https://github.com/Alex-Zhuk/esmpp_lib
 dep_esmpp_lib_commit = 0.9.6
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers meck
+dep_meck_commit = 0.8.13
 LOCAL_DEPS = public_key crypto ssl inets
 
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
